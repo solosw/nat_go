@@ -1,6 +1,6 @@
 # 内网穿透客户端配置
 tunnel_client:
-  server_url: "ws://localhost:8080/ws"  # 服务端WebSocket地址
+  server_url: "ws://game.sooner.abrdns.com:9000/ws"  # 服务端WebSocket地址
   tunnel_id: "solosw"                          # 隧道ID（可选，留空则自动生成）
   target_url: "http://localhost:8090"   # 目标本地服务地址
 
