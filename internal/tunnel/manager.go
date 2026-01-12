@@ -19,6 +19,16 @@ type Tunnel struct {
 	mu            sync.RWMutex
 }
 
+// NewTunnel 创建新的隧道连接
+func NewTunnel(id string, conn *websocket.Conn) *Tunnel {
+	return &Tunnel{
+		ID:            id,
+		Conn:          conn,
+		LastPing:      time.Now(),
+		responseChans: make(map[string]chan *Message),
+	}
+}
+
 // Manager 隧道管理器
 type Manager struct {
 	tunnels  map[string]*Tunnel // tunnelID -> Tunnel
@@ -43,12 +53,7 @@ func (m *Manager) RegisterTunnel(tunnelID string, conn *websocket.Conn) *Tunnel 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	tunnel := &Tunnel{
-		ID:            tunnelID,
-		Conn:          conn,
-		LastPing:      time.Now(),
-		responseChans: make(map[string]chan *Message),
-	}
+	tunnel := NewTunnel(tunnelID, conn)
 
 	// 如果已存在，关闭旧连接
 	if oldTunnel, exists := m.tunnels[tunnelID]; exists {
@@ -66,6 +71,38 @@ func (m *Manager) GetTunnel(tunnelID string) (*Tunnel, bool) {
 	defer m.mu.RUnlock()
 	tunnel, exists := m.tunnels[tunnelID]
 	return tunnel, exists
+}
+
+// GetSingleTunnelID 返回当下唯一的隧道ID（仅在只存在一个隧道时可用）
+func (m *Manager) GetSingleTunnelID() (string, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if len(m.tunnels) != 1 {
+		return "", false
+	}
+
+	for id := range m.tunnels {
+		return id, true
+	}
+
+	return "", false
+}
+
+// GetFirstTunnelID 返回第一个可用的隧道ID（如果存在）
+func (m *Manager) GetFirstTunnelID() (string, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if len(m.tunnels) == 0 {
+		return "", false
+	}
+
+	for id := range m.tunnels {
+		return id, true
+	}
+
+	return "", false
 }
 
 // RemoveTunnel 移除隧道

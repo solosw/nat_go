@@ -3,6 +3,7 @@ tunnel_server:
   port: 8080          # 服务端监听端口
   read_timeout: 60    # 读取超时（秒）
   write_timeout: 60   # 写入超时（秒）
+  private_use: true   # 是否私人使用（true则禁用/tunnel前缀路由，只允许直接访问，如 http://服务端地址/你的路径）
 
 # 应用配置
 app:

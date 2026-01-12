@@ -12,6 +12,10 @@ const (
 	MessageTypeResponse MessageType = "response"
 	// MessageTypeSSE  SSE事件消息（客户端 -> 服务端）
 	MessageTypeSSE MessageType = "sse"
+	// MessageTypeWebSocket WebSocket消息
+	MessageTypeWebSocket MessageType = "websocket"
+	// MessageTypeWebSocketData WebSocket数据消息
+	MessageTypeWebSocketData MessageType = "websocket_data"
 	// MessageTypeError 错误消息
 	MessageTypeError MessageType = "error"
 	// MessageTypePing 心跳消息
@@ -29,8 +33,10 @@ type Message struct {
 	Path    string               `json:"path,omitempty"`    // 请求路径
 	Headers map[string][]string `json:"headers,omitempty"` // HTTP头
 	Body    []byte               `json:"body,omitempty"`    // 请求/响应体
-	Status  int                  `json:"status,omitempty"`  // HTTP状态码
-	Error   string               `json:"error,omitempty"`   // 错误信息
-	SSEData string               `json:"sse_data,omitempty"` // SSE数据
+	Status      int    `json:"status,omitempty"`        // HTTP状态码
+	Error       string `json:"error,omitempty"`         // 错误信息
+	SSEData     string `json:"sse_data,omitempty"`      // SSE数据
+	WSData      []byte `json:"ws_data,omitempty"`       // WebSocket数据
+	WSMessageType int  `json:"ws_message_type,omitempty"` // WebSocket消息类型（1=Text, 2=Binary）
 }
 

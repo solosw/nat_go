@@ -19,6 +19,7 @@ import (
 
 var tunnelManager *tunnel.Manager
 var httpProxy *proxy.HTTPProxy
+var isPrivateUse bool
 
 func main() {
 	// 加载配置文件（可通过环境变量覆盖）
@@ -30,41 +31,51 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载配置文件失败: %v", err)
 	}
-	
+
 	// 检查服务端配置
 	if config.TunnelServer.Port == 0 {
 		log.Fatalf("配置文件中 tunnel_server.port 未设置")
 	}
-	
+
 	log.Printf("配置加载成功: %s v%s", config.App.Name, config.App.Version)
 	log.Printf("服务端端口: %d", config.TunnelServer.Port)
-	
+
 	// 设置Gin模式
 	if config.App.Env == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
-	
+
 	// 初始化隧道管理器
 	tunnelManager = tunnel.NewManager()
 	httpProxy = proxy.NewHTTPProxy(tunnelManager)
-	
+	isPrivateUse = config.TunnelServer.PrivateUse
+
 	// 启动心跳检测
 	tunnelManager.StartHeartbeat()
-	
+
 	// 创建Gin路由器
 	router := gin.Default()
-	
-	// WebSocket连接端点（客户端连接）
+
+	// WebSocket连接端点（客户端连接）- 必须在通配符路由之前
 	router.GET("/ws", handleWebSocket)
-	
-	// HTTP代理端点（外部请求）
-	router.Any("/tunnel/:tunnelID/*path", handleProxyRequest)
-	
-	// 健康检查
+
+	// 健康检查 - 必须在通配符路由之前
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
-	
+
+	// 根据配置决定是否启用多隧道路由
+	if !config.TunnelServer.PrivateUse {
+		// HTTP代理端点（外部请求）- 多隧道场景
+		router.Any("/tunnel/:tunnelID/*path", handleProxyRequest)
+		log.Println("多隧道模式已启用，支持 /tunnel/{隧道ID}/ 前缀访问")
+	} else {
+		log.Println("私人使用模式已启用，仅支持直接路径访问（无需 /tunnel/ 前缀）")
+	}
+
+	// 单隧道场景下的简化访问（使用 NoRoute 处理未匹配的路由）
+	router.NoRoute(handleDefaultProxyRequest)
+
 	// 启动服务器
 	port := fmt.Sprintf(":%d", config.TunnelServer.Port)
 	log.Printf("内网穿透服务端启动在端口 %s", port)
@@ -80,16 +91,16 @@ func handleWebSocket(c *gin.Context) {
 			return true
 		},
 	}
-	
+
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("WebSocket升级失败: %v", err)
 		return
 	}
 	defer conn.Close()
-	
+
 	log.Println("新的WebSocket连接")
-	
+
 	// 等待客户端注册消息
 	var tunnelID string
 	for {
@@ -99,26 +110,26 @@ func handleWebSocket(c *gin.Context) {
 			log.Printf("读取消息失败: %v", err)
 			return
 		}
-		
+
 		if msg.Type == tunnel.MessageTypeRegister {
 			tunnelID = msg.TunnelID
 			if tunnelID == "" {
 				// 如果没有提供tunnelID，生成一个
 				tunnelID = generateTunnelID()
 			}
-			
+
 			// 注册隧道
 			tunnelConn := tunnelManager.RegisterTunnel(tunnelID, conn)
-			
+
 			// 发送注册成功消息
 			response := tunnel.Message{
 				Type:     tunnel.MessageTypeResponse,
 				TunnelID: tunnelID,
 			}
 			conn.WriteJSON(response)
-			
+
 			log.Printf("隧道注册成功: %s", tunnelID)
-			
+
 			// 启动消息分发器
 			tunnelConn.StartMessageDispatcher()
 			break
@@ -129,31 +140,67 @@ func handleWebSocket(c *gin.Context) {
 			}
 		}
 	}
-	
+
 	// 保持连接
 	select {}
 }
-
 
 // handleProxyRequest 处理代理请求（外部HTTP请求）
 func handleProxyRequest(c *gin.Context) {
 	tunnelID := c.Param("tunnelID")
 	path := c.Param("path")
+	processProxyRequest(c, tunnelID, path)
+}
+
+// handleDefaultProxyRequest 处理无隧道前缀的代理请求（单隧道场景）
+// 作为 NoRoute 处理器，处理所有未匹配的路由
+func handleDefaultProxyRequest(c *gin.Context) {
+	// 从请求URL获取路径
+	path := c.Request.URL.Path
 	
+	// 确保路径以 / 开头
+	if path == "" {
+		path = "/"
+	}
+
+	var tunnelID string
+	var ok bool
+
+	if isPrivateUse {
+		// 私人使用模式：使用第一个可用隧道
+		tunnelID, ok = tunnelManager.GetFirstTunnelID()
+		if !ok {
+			c.JSON(503, gin.H{"error": "没有可用的隧道连接"})
+			return
+		}
+	} else {
+		// 多隧道模式：仅当存在唯一隧道时才允许省略前缀
+		tunnelID, ok = tunnelManager.GetSingleTunnelID()
+		if !ok {
+			c.JSON(400, gin.H{"error": "请使用 /tunnel/{隧道ID}/ 前缀访问或仅保持一个隧道连接"})
+			return
+		}
+	}
+
+	processProxyRequest(c, tunnelID, path)
+}
+
+// processProxyRequest 统一的代理处理逻辑
+func processProxyRequest(c *gin.Context, tunnelID, path string) {
 	// 获取隧道连接
 	tunnelConn, exists := tunnelManager.GetTunnel(tunnelID)
 	if !exists {
 		c.JSON(503, gin.H{"error": "隧道不存在或未连接"})
 		return
 	}
-	
+
 	// 读取请求体
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "读取请求体失败"})
 		return
 	}
-	
+
 	// 构建请求消息
 	requestID := generateRequestID()
 	msg := &tunnel.Message{
@@ -164,32 +211,38 @@ func handleProxyRequest(c *gin.Context) {
 		Headers: c.Request.Header,
 		Body:    body,
 	}
-	
+
 	// 检查是否是SSE请求
 	if proxy.IsSSERequest(c.Request.Header) {
 		handleSSEProxy(c, tunnelConn, msg)
 		return
 	}
-	
+
+	// 检查是否是WebSocket请求
+	if proxy.IsWebSocketRequest(c.Request.Header) {
+		proxy.HandleWebSocketProxy(c, tunnelConn, requestID, path)
+		return
+	}
+
 	// 转发HTTP请求
 	respMsg, err := httpProxy.ForwardRequest(tunnelID, msg)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "转发请求失败: " + err.Error()})
 		return
 	}
-	
+
 	if respMsg.Type == tunnel.MessageTypeError {
 		c.JSON(500, gin.H{"error": respMsg.Error})
 		return
 	}
-	
+
 	// 设置响应头
 	for key, values := range respMsg.Headers {
 		for _, value := range values {
 			c.Header(key, value)
 		}
 	}
-	
+
 	// 返回响应
 	c.Data(respMsg.Status, c.GetHeader("Content-Type"), respMsg.Body)
 }
@@ -202,25 +255,25 @@ func handleSSEProxy(c *gin.Context, tunnelConn *tunnel.Tunnel, msg *tunnel.Messa
 		c.JSON(500, gin.H{"error": "发送请求失败: " + err.Error()})
 		return
 	}
-	
+
 	// 设置SSE响应头
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
-	
+
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		c.JSON(500, gin.H{"error": "响应不支持流式传输"})
 		return
 	}
-	
+
 	flusher.Flush()
-	
+
 	// 注册SSE响应通道
 	responseChan := tunnelConn.RegisterResponseChan(msg.ID)
 	defer tunnelConn.UnregisterResponseChan(msg.ID)
-	
+
 	// 监听SSE消息
 	timeout := time.After(5 * time.Minute) // SSE超时5分钟
 	for {

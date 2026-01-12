@@ -87,15 +87,12 @@ func main() {
 	if registerResp.TunnelID != "" {
 		tunnelID = registerResp.TunnelID
 		log.Printf("隧道注册成功，隧道ID: %s", tunnelID)
-		log.Printf("外部访问地址: http://服务端地址/tunnel/%s/你的路径", tunnelID)
+		log.Printf("外部访问地址: http://服务端地址/你的路径（单隧道默认）")
+		log.Printf("多隧道场景访问: http://服务端地址/tunnel/%s/你的路径", tunnelID)
 	}
 
 	// 创建隧道连接对象
-	tunnelConn = &tunnel.Tunnel{
-		ID:       tunnelID,
-		Conn:     conn,
-		LastPing: time.Now(),
-	}
+	tunnelConn = tunnel.NewTunnel(tunnelID, conn)
 
 	// 启动心跳
 	go startHeartbeat()
@@ -155,6 +152,17 @@ func handleRequests() {
 		// 处理请求
 		if msg.Type == tunnel.MessageTypeRequest {
 			go handleRequest(&msg)
+		}
+
+		// 处理WebSocket请求
+		if msg.Type == tunnel.MessageTypeWebSocket {
+			go handleWebSocketRequest(&msg)
+		}
+
+		// 处理WebSocket数据消息
+		if msg.Type == tunnel.MessageTypeWebSocketData {
+			// WebSocket数据消息通过消息分发器处理
+			tunnelConn.DispatchMessage(&msg)
 		}
 	}
 }
@@ -261,4 +269,9 @@ func handleSSERequest(msg *tunnel.Message) {
 		}
 		tunnelConn.SendMessage(&errorMsg)
 	}
+}
+
+// handleWebSocketRequest 处理WebSocket请求
+func handleWebSocketRequest(msg *tunnel.Message) {
+	proxy.HandleClientWebSocket(targetURL, msg, tunnelConn)
 }

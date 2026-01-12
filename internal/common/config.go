@@ -67,9 +67,10 @@ type LogConfig struct {
 
 // TunnelServerConfig 内网穿透服务端配置
 type TunnelServerConfig struct {
-	Port         int `yaml:"port"`          // 服务端监听端口
-	ReadTimeout  int `yaml:"read_timeout"`  // 读取超时（秒）
-	WriteTimeout int `yaml:"write_timeout"` // 写入超时（秒）
+	Port         int  `yaml:"port"`          // 服务端监听端口
+	ReadTimeout  int  `yaml:"read_timeout"`  // 读取超时（秒）
+	WriteTimeout int  `yaml:"write_timeout"` // 写入超时（秒）
+	PrivateUse   bool `yaml:"private_use"`   // 是否私人使用（true则禁用/tunnel前缀路由，只允许直接访问）
 }
 
 // TunnelClientConfig 内网穿透客户端配置

@@ -126,3 +126,28 @@ func IsSSERequest(headers map[string][]string) bool {
 	return false
 }
 
+// IsWebSocketRequest 判断是否是WebSocket请求
+func IsWebSocketRequest(headers map[string][]string) bool {
+	connection := headers["Connection"]
+	upgrade := headers["Upgrade"]
+	
+	hasConnection := false
+	hasUpgrade := false
+	
+	for _, val := range connection {
+		if strings.ToLower(val) == "upgrade" {
+			hasConnection = true
+			break
+		}
+	}
+	
+	for _, val := range upgrade {
+		if strings.ToLower(val) == "websocket" {
+			hasUpgrade = true
+			break
+		}
+	}
+	
+	return hasConnection && hasUpgrade
+}
+
