@@ -1,0 +1,258 @@
+package main
+
+import (
+	"awesomeProject/internal/common"
+	"awesomeProject/internal/proxy"
+	"awesomeProject/internal/tunnel"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+)
+
+var tunnelManager *tunnel.Manager
+var httpProxy *proxy.HTTPProxy
+
+func main() {
+	// 加载配置文件（可通过环境变量覆盖）
+	configPath := os.Getenv("TUNNEL_SERVER_CONFIG")
+	if configPath == "" {
+		configPath = "./configs/server.yaml"
+	}
+	config, err := common.LoadConfig(configPath)
+	if err != nil {
+		log.Fatalf("加载配置文件失败: %v", err)
+	}
+	
+	// 检查服务端配置
+	if config.TunnelServer.Port == 0 {
+		log.Fatalf("配置文件中 tunnel_server.port 未设置")
+	}
+	
+	log.Printf("配置加载成功: %s v%s", config.App.Name, config.App.Version)
+	log.Printf("服务端端口: %d", config.TunnelServer.Port)
+	
+	// 设置Gin模式
+	if config.App.Env == "production" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+	
+	// 初始化隧道管理器
+	tunnelManager = tunnel.NewManager()
+	httpProxy = proxy.NewHTTPProxy(tunnelManager)
+	
+	// 启动心跳检测
+	tunnelManager.StartHeartbeat()
+	
+	// 创建Gin路由器
+	router := gin.Default()
+	
+	// WebSocket连接端点（客户端连接）
+	router.GET("/ws", handleWebSocket)
+	
+	// HTTP代理端点（外部请求）
+	router.Any("/tunnel/:tunnelID/*path", handleProxyRequest)
+	
+	// 健康检查
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
+	
+	// 启动服务器
+	port := fmt.Sprintf(":%d", config.TunnelServer.Port)
+	log.Printf("内网穿透服务端启动在端口 %s", port)
+	if err := router.Run(port); err != nil {
+		log.Fatalf("服务器启动失败: %v", err)
+	}
+}
+
+// handleWebSocket 处理WebSocket连接（客户端连接）
+func handleWebSocket(c *gin.Context) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
+	
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Printf("WebSocket升级失败: %v", err)
+		return
+	}
+	defer conn.Close()
+	
+	log.Println("新的WebSocket连接")
+	
+	// 等待客户端注册消息
+	var tunnelID string
+	for {
+		var msg tunnel.Message
+		err := conn.ReadJSON(&msg)
+		if err != nil {
+			log.Printf("读取消息失败: %v", err)
+			return
+		}
+		
+		if msg.Type == tunnel.MessageTypeRegister {
+			tunnelID = msg.TunnelID
+			if tunnelID == "" {
+				// 如果没有提供tunnelID，生成一个
+				tunnelID = generateTunnelID()
+			}
+			
+			// 注册隧道
+			tunnelConn := tunnelManager.RegisterTunnel(tunnelID, conn)
+			
+			// 发送注册成功消息
+			response := tunnel.Message{
+				Type:     tunnel.MessageTypeResponse,
+				TunnelID: tunnelID,
+			}
+			conn.WriteJSON(response)
+			
+			log.Printf("隧道注册成功: %s", tunnelID)
+			
+			// 启动消息分发器
+			tunnelConn.StartMessageDispatcher()
+			break
+		} else if msg.Type == tunnel.MessageTypePong {
+			// 心跳响应
+			if tunnelConn, exists := tunnelManager.GetTunnel(msg.TunnelID); exists {
+				tunnelConn.UpdatePing()
+			}
+		}
+	}
+	
+	// 保持连接
+	select {}
+}
+
+
+// handleProxyRequest 处理代理请求（外部HTTP请求）
+func handleProxyRequest(c *gin.Context) {
+	tunnelID := c.Param("tunnelID")
+	path := c.Param("path")
+	
+	// 获取隧道连接
+	tunnelConn, exists := tunnelManager.GetTunnel(tunnelID)
+	if !exists {
+		c.JSON(503, gin.H{"error": "隧道不存在或未连接"})
+		return
+	}
+	
+	// 读取请求体
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "读取请求体失败"})
+		return
+	}
+	
+	// 构建请求消息
+	requestID := generateRequestID()
+	msg := &tunnel.Message{
+		Type:    tunnel.MessageTypeRequest,
+		ID:      requestID,
+		Method:  c.Request.Method,
+		Path:    path,
+		Headers: c.Request.Header,
+		Body:    body,
+	}
+	
+	// 检查是否是SSE请求
+	if proxy.IsSSERequest(c.Request.Header) {
+		handleSSEProxy(c, tunnelConn, msg)
+		return
+	}
+	
+	// 转发HTTP请求
+	respMsg, err := httpProxy.ForwardRequest(tunnelID, msg)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "转发请求失败: " + err.Error()})
+		return
+	}
+	
+	if respMsg.Type == tunnel.MessageTypeError {
+		c.JSON(500, gin.H{"error": respMsg.Error})
+		return
+	}
+	
+	// 设置响应头
+	for key, values := range respMsg.Headers {
+		for _, value := range values {
+			c.Header(key, value)
+		}
+	}
+	
+	// 返回响应
+	c.Data(respMsg.Status, c.GetHeader("Content-Type"), respMsg.Body)
+}
+
+// handleSSEProxy 处理SSE代理请求
+func handleSSEProxy(c *gin.Context, tunnelConn *tunnel.Tunnel, msg *tunnel.Message) {
+	// 发送请求到客户端
+	err := tunnelConn.SendMessage(msg)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "发送请求失败: " + err.Error()})
+		return
+	}
+	
+	// 设置SSE响应头
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(500, gin.H{"error": "响应不支持流式传输"})
+		return
+	}
+	
+	flusher.Flush()
+	
+	// 注册SSE响应通道
+	responseChan := tunnelConn.RegisterResponseChan(msg.ID)
+	defer tunnelConn.UnregisterResponseChan(msg.ID)
+	
+	// 监听SSE消息
+	timeout := time.After(5 * time.Minute) // SSE超时5分钟
+	for {
+		select {
+		case <-timeout:
+			return
+		case respMsg := <-responseChan:
+			// 检查是否是当前请求的SSE消息
+			if respMsg.Type == tunnel.MessageTypeSSE && respMsg.ID == msg.ID {
+				// 写入SSE数据
+				c.Writer.Write([]byte(respMsg.SSEData + "\n"))
+				flusher.Flush()
+			} else if respMsg.Type == tunnel.MessageTypeError && respMsg.ID == msg.ID {
+				// 错误消息
+				c.Writer.Write([]byte("event: error\ndata: " + respMsg.Error + "\n\n"))
+				flusher.Flush()
+				return
+			}
+		}
+	}
+}
+
+// generateTunnelID 生成隧道ID
+func generateTunnelID() string {
+	bytes := make([]byte, 8)
+	rand.Read(bytes)
+	return "tunnel-" + hex.EncodeToString(bytes)
+}
+
+// generateRequestID 生成请求ID
+func generateRequestID() string {
+	bytes := make([]byte, 16)
+	rand.Read(bytes)
+	return "req-" + hex.EncodeToString(bytes)
+}
