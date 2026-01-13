@@ -12,6 +12,12 @@ const (
 	MessageTypeResponse MessageType = "response"
 	// MessageTypeSSE  SSE事件消息（客户端 -> 服务端）
 	MessageTypeSSE MessageType = "sse"
+	// MessageTypeTCPInit TCP连接初始化
+	MessageTypeTCPInit MessageType = "tcp_init"
+	// MessageTypeTCPData TCP数据传输
+	MessageTypeTCPData MessageType = "tcp_data"
+	// MessageTypeTCPClose TCP连接关闭
+	MessageTypeTCPClose MessageType = "tcp_close"
 	// MessageTypeWebSocket WebSocket消息
 	MessageTypeWebSocket MessageType = "websocket"
 	// MessageTypeWebSocketData WebSocket数据消息

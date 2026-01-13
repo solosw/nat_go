@@ -10,7 +10,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -20,6 +22,8 @@ import (
 var tunnelManager *tunnel.Manager
 var httpProxy *proxy.HTTPProxy
 var isPrivateUse bool
+var tcpPort int
+var tcpConns sync.Map // connID -> net.Conn
 
 func main() {
 	// 加载配置文件（可通过环境变量覆盖）
@@ -49,6 +53,7 @@ func main() {
 	tunnelManager = tunnel.NewManager()
 	httpProxy = proxy.NewHTTPProxy(tunnelManager)
 	isPrivateUse = config.TunnelServer.PrivateUse
+	tcpPort = config.TunnelServer.TCPPort
 
 	// 启动心跳检测
 	tunnelManager.StartHeartbeat()
@@ -75,6 +80,14 @@ func main() {
 
 	// 单隧道场景下的简化访问（使用 NoRoute 处理未匹配的路由）
 	router.NoRoute(handleDefaultProxyRequest)
+
+	// 启动TCP穿透监听
+	if tcpPort > 0 {
+		go startTCPListener(tcpPort)
+		log.Printf("TCP穿透监听端口: %d", tcpPort)
+	} else {
+		log.Println("TCP穿透未开启，如需开启请配置 tunnel_server.tcp_port")
+	}
 
 	// 启动服务器
 	port := fmt.Sprintf(":%d", config.TunnelServer.Port)
@@ -294,6 +307,116 @@ func handleSSEProxy(c *gin.Context, tunnelConn *tunnel.Tunnel, msg *tunnel.Messa
 			}
 		}
 	}
+}
+
+// startTCPListener 启动TCP穿透监听
+func startTCPListener(port int) {
+	addr := fmt.Sprintf(":%d", port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("启动TCP监听失败: %v", err)
+		return
+	}
+
+	for {
+		publicConn, err := ln.Accept()
+		if err != nil {
+			log.Printf("接受TCP连接失败: %v", err)
+			continue
+		}
+		go handleTCPConnection(publicConn)
+	}
+}
+
+// handleTCPConnection 处理单个TCP连接
+func handleTCPConnection(publicConn net.Conn) {
+	tunnelID, ok := selectTunnelIDForTCP()
+	if !ok {
+		log.Printf("无可用隧道，拒绝TCP连接来自 %s", publicConn.RemoteAddr().String())
+		publicConn.Close()
+		return
+	}
+
+	tunnelConn, exists := tunnelManager.GetTunnel(tunnelID)
+	if !exists {
+		log.Printf("隧道 %s 不存在，拒绝TCP连接", tunnelID)
+		publicConn.Close()
+		return
+	}
+
+	connID := generateRequestID()
+
+	// 注册响应通道
+	responseChan := tunnelConn.RegisterResponseChan(connID)
+	defer tunnelConn.UnregisterResponseChan(connID)
+
+	// 发送TCP初始化消息
+	initMsg := &tunnel.Message{
+		Type: tunnel.MessageTypeTCPInit,
+		ID:   connID,
+	}
+	if err := tunnelConn.SendMessage(initMsg); err != nil {
+		log.Printf("发送TCP初始化失败: %v", err)
+		publicConn.Close()
+		return
+	}
+
+	// 从公网读取数据并转发给内网
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := publicConn.Read(buf)
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buf[:n])
+				dataMsg := &tunnel.Message{
+					Type: tunnel.MessageTypeTCPData,
+					ID:   connID,
+					Body: data,
+				}
+				if err := tunnelConn.SendMessage(dataMsg); err != nil {
+					log.Printf("发送TCP数据失败: %v", err)
+					break
+				}
+			}
+			if err != nil {
+				closeMsg := &tunnel.Message{
+					Type: tunnel.MessageTypeTCPClose,
+					ID:   connID,
+				}
+				tunnelConn.SendMessage(closeMsg)
+				break
+			}
+		}
+	}()
+
+	// 从内网读取数据并转发给公网
+	for {
+		msg, ok := <-responseChan
+		if !ok {
+			break
+		}
+
+		switch msg.Type {
+		case tunnel.MessageTypeTCPData:
+			if _, err := publicConn.Write(msg.Body); err != nil {
+				log.Printf("写入公网TCP失败: %v", err)
+				publicConn.Close()
+				return
+			}
+		case tunnel.MessageTypeTCPClose, tunnel.MessageTypeError:
+			publicConn.Close()
+			return
+		}
+	}
+}
+
+// selectTunnelIDForTCP 选择用于TCP穿透的隧道ID
+func selectTunnelIDForTCP() (string, bool) {
+	if isPrivateUse {
+		return tunnelManager.GetFirstTunnelID()
+	}
+	return tunnelManager.GetSingleTunnelID()
 }
 
 // generateTunnelID 生成隧道ID

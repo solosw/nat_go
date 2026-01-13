@@ -71,6 +71,7 @@ type TunnelServerConfig struct {
 	ReadTimeout  int  `yaml:"read_timeout"`  // 读取超时（秒）
 	WriteTimeout int  `yaml:"write_timeout"` // 写入超时（秒）
 	PrivateUse   bool `yaml:"private_use"`   // 是否私人使用（true则禁用/tunnel前缀路由，只允许直接访问）
+	TCPPort      int  `yaml:"tcp_port"`      // TCP穿透监听端口（0表示关闭）
 }
 
 // TunnelClientConfig 内网穿透客户端配置
@@ -78,6 +79,7 @@ type TunnelClientConfig struct {
 	ServerURL string `yaml:"server_url"` // 服务端WebSocket地址，如 ws://example.com:8080/ws
 	TunnelID  string `yaml:"tunnel_id"`  // 隧道ID（可选，不提供则自动生成）
 	TargetURL string `yaml:"target_url"` // 目标本地服务地址，如 http://localhost:8080
+	TCPTarget string `yaml:"tcp_target"` // TCP转发目标地址，如 127.0.0.1:22（0或空表示关闭）
 }
 
 // LoadConfig 加载配置文件

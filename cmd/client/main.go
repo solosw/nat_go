@@ -6,9 +6,11 @@ import (
 	"awesomeProject/internal/tunnel"
 	"bufio"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,8 +21,10 @@ var (
 	serverURL  string
 	tunnelID   string
 	targetURL  string
+	tcpTarget  string
 	conn       *websocket.Conn
 	tunnelConn *tunnel.Tunnel
+	tcpConns   sync.Map // connID -> net.Conn
 )
 
 func main() {
@@ -45,6 +49,7 @@ func main() {
 	serverURL = config.TunnelClient.ServerURL
 	tunnelID = config.TunnelClient.TunnelID
 	targetURL = config.TunnelClient.TargetURL
+	tcpTarget = config.TunnelClient.TCPTarget
 
 	log.Printf("配置加载成功: %s v%s", config.App.Name, config.App.Version)
 	log.Printf("连接到服务端: %s", serverURL)
@@ -154,6 +159,21 @@ func handleRequests() {
 			go handleRequest(&msg)
 		}
 
+		// 处理TCP隧道初始化
+		if msg.Type == tunnel.MessageTypeTCPInit {
+			go handleTCPInit(&msg)
+		}
+
+		// 处理TCP数据（必须保持顺序，不能开goroutine）
+		if msg.Type == tunnel.MessageTypeTCPData {
+			handleTCPData(&msg)
+		}
+
+		// 处理TCP关闭
+		if msg.Type == tunnel.MessageTypeTCPClose {
+			handleTCPClose(&msg)
+		}
+
 		// 处理WebSocket请求
 		if msg.Type == tunnel.MessageTypeWebSocket {
 			go handleWebSocketRequest(&msg)
@@ -191,6 +211,85 @@ func handleRequest(msg *tunnel.Message) {
 	err = tunnelConn.SendMessage(respMsg)
 	if err != nil {
 		log.Printf("发送响应失败: %v", err)
+	}
+}
+
+// handleTCPInit 处理TCP隧道初始化
+func handleTCPInit(msg *tunnel.Message) {
+	if tcpTarget == "" {
+		errMsg := &tunnel.Message{
+			Type:  tunnel.MessageTypeError,
+			ID:    msg.ID,
+			Error: "客户端未配置 tcp_target，无法建立TCP隧道",
+		}
+		tunnelConn.SendMessage(errMsg)
+		return
+	}
+
+	localConn, err := net.Dial("tcp", tcpTarget)
+	if err != nil {
+		errMsg := &tunnel.Message{
+			Type:  tunnel.MessageTypeError,
+			ID:    msg.ID,
+			Error: "连接本地TCP失败: " + err.Error(),
+		}
+		tunnelConn.SendMessage(errMsg)
+		return
+	}
+
+	tcpConns.Store(msg.ID, localConn)
+
+	// 将本地TCP的数据转发到服务端
+	go func(connID string, c net.Conn) {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := c.Read(buf)
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buf[:n])
+				dataMsg := &tunnel.Message{
+					Type: tunnel.MessageTypeTCPData,
+					ID:   connID,
+					Body: data,
+				}
+				if err := tunnelConn.SendMessage(dataMsg); err != nil {
+					log.Printf("发送TCP数据失败: %v", err)
+					break
+				}
+			}
+			if err != nil {
+				closeMsg := &tunnel.Message{
+					Type: tunnel.MessageTypeTCPClose,
+					ID:   connID,
+				}
+				tunnelConn.SendMessage(closeMsg)
+				break
+			}
+		}
+		tcpConns.Delete(connID)
+		c.Close()
+	}(msg.ID, localConn)
+}
+
+// handleTCPData 将服务端的数据写入本地TCP连接
+func handleTCPData(msg *tunnel.Message) {
+	if v, ok := tcpConns.Load(msg.ID); ok {
+		if c, ok2 := v.(net.Conn); ok2 {
+			if _, err := c.Write(msg.Body); err != nil {
+				log.Printf("写入本地TCP失败: %v", err)
+				handleTCPClose(msg)
+			}
+		}
+	}
+}
+
+// handleTCPClose 关闭本地TCP连接
+func handleTCPClose(msg *tunnel.Message) {
+	if v, ok := tcpConns.Load(msg.ID); ok {
+		if c, ok2 := v.(net.Conn); ok2 {
+			c.Close()
+		}
+		tcpConns.Delete(msg.ID)
 	}
 }
 

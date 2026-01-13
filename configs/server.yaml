@@ -4,6 +4,7 @@ tunnel_server:
   read_timeout: 60    # 读取超时（秒）
   write_timeout: 60   # 写入超时（秒）
   private_use: true   # 是否私人使用（true则禁用/tunnel前缀路由，只允许直接访问，如 http://服务端地址/你的路径）
+  tcp_port: 9000         # TCP穿透监听端口，0表示关闭（示例 9000）
 
 # 应用配置
 app:
