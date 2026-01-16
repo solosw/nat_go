@@ -216,11 +216,16 @@ func processProxyRequest(c *gin.Context, tunnelID, path string) {
 
 	// 构建请求消息
 	requestID := generateRequestID()
+	// 将查询参数附加到路径上
+	fullPath := path
+	if c.Request.URL.RawQuery != "" {
+		fullPath = path + "?" + c.Request.URL.RawQuery
+	}
 	msg := &tunnel.Message{
 		Type:    tunnel.MessageTypeRequest,
 		ID:      requestID,
 		Method:  c.Request.Method,
-		Path:    path,
+		Path:    fullPath,
 		Headers: c.Request.Header,
 		Body:    body,
 	}
@@ -233,7 +238,7 @@ func processProxyRequest(c *gin.Context, tunnelID, path string) {
 
 	// 检查是否是WebSocket请求
 	if proxy.IsWebSocketRequest(c.Request.Header) {
-		proxy.HandleWebSocketProxy(c, tunnelConn, requestID, path)
+		proxy.HandleWebSocketProxy(c, tunnelConn, requestID, fullPath)
 		return
 	}
 
